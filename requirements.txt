@@ -1,0 +1,20 @@
+# Core Frameworks
+llama-index
+llama-index-vector-stores-neo4j
+langgraph
+autogen
+mcp
+
+# Data Processing
+pypdf
+pandas
+python-dotenv
+
+# Graph Database
+neo4j
+
+# Utilities
+ruff
+mypy
+pytest
+pytest-mock
