@@ -64,9 +64,9 @@ This document provides essential instructions and conventions for agentic coding
 - **Edges:** Use conditional edges for routing based on "Reflection" or "Self-Correction" results.
 
 ### LlamaIndex & GraphRAG
-- **Indexing:** Use `PropertyGraphIndex` for Neo4j integration as per README.
-- **Schema:** Maintain a clear schema of entities (Company, Product, Policy) and relations (SUPPLIES, COMPETES_WITH).
-- **Queries:** Encapsulate complex Cypher queries within dedicated "Retriever" classes.
+- **Indexing:** Use a custom "Two-Stage Pipeline" (Filter -> Extract) with native Neo4j drivers (`src.utils.database`). Do NOT use `PropertyGraphIndex` to avoid graph pollution.
+- **Schema:** Strict adherence to `src.schema.ontology`. All extraction logic must validate against `EntityLabel` and `RelationType` enums.
+- **Queries:** Use `src.tools.cypher_query` for Text-to-Cypher generation. Ensure queries are read-only and optimized (e.g., using `OPTIONAL MATCH`).
 
 ### Tooling (MCP & Functions)
 - **Model Context Protocol (MCP):** When implementing MCP servers, ensure they are modular and testable independently of the LLM. Use the standard MCP SDKs where possible.

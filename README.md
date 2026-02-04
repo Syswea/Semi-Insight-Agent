@@ -29,25 +29,25 @@
 
 ## 三、 三周开发计划
 
-### 第一周：构建 GraphRAG 知识基座
+### 第一周：构建 GraphRAG 知识基座 [已完成]
 **目标**：让 Agent “懂”半导体产业链。
 *   部署 Neo4j 数据库（推荐 Docker）。
-*   使用 LlamaIndex 的 `PropertyGraphIndex` 读取 PDF 报告。
-*   **核心实现**：提取公司（Entity）及其供应/竞争关系（Relationship）。
+*   **核心实现**：自定义 `Two-Stage Pipeline` 提取公司（Entity）及其关系。
+*   **技术栈变更**：放弃 `PropertyGraphIndex`，改用 **原生 Cypher** 写入以保证图谱纯净度。
 *   **交付标准**：实现基础路径查询（如“美国限制光刻机出口对国产厂商的影响”）。
 
-### 第二周：LangGraph 核心流转逻辑
+### 第二周：LangGraph 核心流转逻辑 [已完成]
 **目标**：让 Agent 具备拆解任务和调用工具的能力。
-*   **Planning 节点**：接收问题并拆解子任务。
-*   **ReAct 节点**：集成 MCP Server 封装搜索工具，并调用 GraphRAG 查询函数。
-*   **Reflection 节点**：检查幻觉（纠正逻辑错误）。
-*   **交付标准**：在控制台完整展示 `Thought -> Action -> Observation` 循环。
+*   **State 定义**：完成 `AgentState` 共享内存结构。
+*   **ReAct 循环**：实现 `Reasoning` -> `Tool` -> `Reasoning` 的闭环。
+*   **核心工具**：构建 **Text-to-Cypher** 引擎，支持自然语言查库。
+*   **交互界面**：基于 Streamlit 构建 Web UI，支持实时思维链可视化。
 
-### 第三周：多 Agent 对抗与演示
+### 第三周：多 Agent 对抗与演示 [进行中]
 **目标**：提升研判报告的深度与专业感。
+*   **Web 搜索集成**：接入 DuckDuckGo/Tavily 解决知识滞后问题。
 *   **AutoGen 集成**：定义 `BullishAgent` (看多) 与 `BearishAgent` (看空)。
 *   **辩论流程**：对研判结果进行 2 轮对抗辩论，输出多维深度报告。
-*   **项目演示**：准备可视化 Trace 流程图展示状态机流转。
 
 ---
 

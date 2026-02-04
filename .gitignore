@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+.python-version
+
+# Neo4j data and logs
+neo4j/data/
+neo4j/logs/
+neo4j/plugins/*.jar
+!neo4j/plugins/apoc.jar
+
+# Project specific
+.ruff_cache/
+data/reports/
+data/*.pdf
+
+# Streamlit
+.streamlit/
