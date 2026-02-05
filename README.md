@@ -43,11 +43,16 @@
 *   **核心工具**：构建 **Text-to-Cypher** 引擎，支持自然语言查库。
 *   **交互界面**：基于 Streamlit 构建 Web UI，支持实时思维链可视化。
 
-### 第三周：多 Agent 对抗与演示 [进行中]
+### 第三周：多 Agent 对抗与演示 [已完成 Web 搜索]
 **目标**：提升研判报告的深度与专业感。
-*   **Web 搜索集成**：接入 DuckDuckGo/Tavily 解决知识滞后问题。
-*   **AutoGen 集成**：定义 `BullishAgent` (看多) 与 `BearishAgent` (看空)。
-*   **辩论流程**：对研判结果进行 2 轮对抗辩论，输出多维深度报告。
+*   **Web 搜索集成**：✅ 已完成
+    *   实现手写 **MCP Server**，符合面试要求
+    *   支持 **DuckDuckGo** 搜索（免费，无 API Key）
+    *   双传输模式：**stdio** (Claude/Cursor) + **HTTP** (Web 应用)
+    *   自动启动机制：Streamlit 启动时自动检测并启动 MCP Server
+*   **AutoGen 集成**：待实现
+    *   定义 `BullishAgent` (看多) 与 `BearishAgent` (看空)。
+    *   **辩论流程**：对研判结果进行 2 轮对抗辩论，输出多维深度报告。
 
 ---
 
@@ -58,7 +63,7 @@ graph TD
     UserQuery[用户问题] --> Planner[LangGraph: Planner 节点]
     Planner --> Exec[LangGraph: ReAct 节点]
     Exec --> |Function Call| GRAG[GraphRAG: 查关联关系]
-    Exec --> |MCP Tool| WebSearch[Search: 查实时资讯]
+    Exec --> |MCP Tool| WebSearch[MCP: DuckDuckGo 实时搜索]
     Exec --> Collector[信息汇总]
     Collector --> Reflector[Reflection: 自检纠错]
     Reflector -- 失败 --> Exec

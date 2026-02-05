@@ -37,7 +37,8 @@ llm = OpenAILike(
 
 def reasoning_node(state: AgentState) -> Dict[str, Any]:
     """
-    推理节点：分析当前状态，决定下一步行动 (查图谱 or 结束)。
+    推理节点：分析当前状态，决定下一步行动 (查图谱 or 查网络 or 结束)。
+
     由于本地模型 Function Calling 不稳定，这里使用严格的 JSON 格式提示工程。
     """
     messages = state["messages"]
@@ -45,12 +46,18 @@ def reasoning_node(state: AgentState) -> Dict[str, Any]:
     # 构建 Prompt
     system_prompt = (
         "You are a Semiconductor Industry Analyst Agent.\n"
-        "You have access to a Knowledge Graph tool: `query_graph`.\n"
-        "Input: A natural language question.\n"
-        "Output: JSON\n\n"
+        "You have access to TWO tools:\n"
+        "1. `query_graph` - Query the Knowledge Graph for entities and relationships\n"
+        "2. `web_search` - Search the web for real-time information\n\n"
+        "--- Decision Rules ---\n"
+        "- Use `query_graph` for: relationships between companies, technologies, supply chain info\n"
+        "- Use `web_search` for: founding dates, HQ locations, current news, recent events\n"
+        "- Use `final_answer` when you have collected sufficient information\n\n"
         "--- Format ---\n"
-        "If you need more info from the graph:\n"
+        "If you need more info from the knowledge graph:\n"
         '{"action": "query_graph", "query": "YOUR_QUESTION_HERE"}\n\n'
+        "If you need real-time info from the web:\n"
+        '{"action": "web_search", "query": "YOUR_QUESTION_HERE"}\n\n'
         "If you have enough info to answer:\n"
         '{"action": "final_answer", "content": "YOUR_FINAL_ANSWER"}\n\n'
         "--- Constraints ---\n"
@@ -111,13 +118,14 @@ def reasoning_node(state: AgentState) -> Dict[str, Any]:
 def tool_execution_node(state: AgentState) -> Dict[str, Any]:
     """
     执行节点：解析上一步的 JSON 并执行工具。
-    """
-    last_message = state["messages"][-1]
 
-    # Check if the last message is an AIMessage with tool calls
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        # Handle native tool calls if we switch to that later
-        pass
+    支持的工具：
+    - query_graph: 查询知识图谱 (Neo4j)
+    - web_search: 网络搜索 (DuckDuckGo via MCP)
+    """
+    from src.tools.web_search import web_search_tool
+
+    last_message = state["messages"][-1]
 
     # Fallback to JSON parsing for our current implementation
     try:
@@ -125,8 +133,6 @@ def tool_execution_node(state: AgentState) -> Dict[str, Any]:
         if isinstance(content, str):
             decision = json.loads(content)
         else:
-            # Handle list content if necessary, or just extract text
-            # Assuming simple string content for now
             decision = json.loads(str(content))
 
         action = decision.get("action")
@@ -139,12 +145,145 @@ def tool_execution_node(state: AgentState) -> Dict[str, Any]:
                 "messages": [SystemMessage(content=f"Graph Search Result: {result}")]
             }
 
+        elif action == "web_search":
+            query = decision.get("query")
+            logger.info(f"Executing Tool: web_search('{query}')")
+            result = web_search_tool.search_web(query)
+            return {"messages": [SystemMessage(content=f"Web Search Result: {result}")]}
+
         elif action == "final_answer":
-            # 这是一个结束信号，通常不应该进入这个节点，
-            # 但如果 LangGraph 路由配置有误，这里可以作为安全网
             return {}
 
         return {"messages": [SystemMessage(content=f"Unknown action: {action}")]}
 
     except Exception as e:
         return {"messages": [SystemMessage(content=f"Tool execution failed: {e}")]}
+
+
+def reflection_node(state: AgentState) -> Dict[str, Any]:
+    """
+    自检节点：评估当前答案质量，决定是否需要重新推理。
+
+    检查项：
+    1. 工具调用结果是否有效（非空、非错误）
+    2. 答案是否完整（是否回答了用户的核心问题）
+    3. 是否达到最大反思次数
+    """
+    messages = state["messages"]
+    reflection_count = state.get("reflection_count", 0)
+    max_reflections = state.get("max_reflections", 2)
+
+    logger.info(f"🔍 Reflection Node: Count={reflection_count}/{max_reflections}")
+
+    # 提取用户问题和最终答案
+    user_question = None
+    final_answer = None
+
+    for msg in messages:
+        if isinstance(msg, HumanMessage) and not user_question:
+            user_question = msg.content
+
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            try:
+                decision = json.loads(msg.content)
+                if decision.get("action") == "final_answer":
+                    final_answer = decision.get("content")
+                    break
+            except:
+                pass
+
+    if not final_answer:
+        logger.warning("⚠️ Reflection: No final answer found, skipping reflection.")
+        return {
+            "messages": [
+                SystemMessage(content="Reflection skipped: No answer to evaluate.")
+            ]
+        }
+
+    # 如果已达到最大反思次数，直接通过
+    if reflection_count >= max_reflections:
+        logger.info(
+            f"✅ Reflection: Max reflections reached ({max_reflections}), passing."
+        )
+        return {
+            "messages": [
+                SystemMessage(
+                    content=f"✅ Reflection PASSED: Maximum reflection limit reached."
+                )
+            ],
+            "reflection_count": reflection_count + 1,
+        }
+
+    # 构建反思 Prompt
+    prompt = (
+        "You are a Quality Assurance Agent for semiconductor industry analysis.\n"
+        "Evaluate the following answer based on what's AVAILABLE IN THE KNOWLEDGE GRAPH.\n\n"
+        f"User Question: {user_question}\n\n"
+        f"Answer: {final_answer}\n\n"
+        "Evaluation Criteria (IMPORTANT):\n"
+        "1. Does the answer address the user's question using available knowledge graph data?\n"
+        "2. If the knowledge graph lacks certain information (e.g., founding year, HQ location), "
+        "the answer should state limitations rather than invent information.\n"
+        "3. Is the answer specific given the AVAILABLE data (not generic)?\n"
+        "4. Does it cite concrete entities/technologies that exist in the graph?\n\n"
+        "Scoring Rules:\n"
+        "- PASS if the answer uses available graph data and acknowledges limitations honestly\n"
+        "- FAIL only if the answer is generic, off-topic, or makes unverifiable claims\n\n"
+        "Respond with JSON ONLY:\n"
+        '{"pass": true, "reason": "explanation"} if acceptable\n'
+        '{"pass": false, "reason": "specific issue"} if needs improvement\n\n'
+        "Output JSON:"
+    )
+
+    try:
+        raw_response = llm.complete(prompt).text.strip()
+        logger.info(f"Reflection LLM response: {raw_response[:200]}...")
+
+        # 清洗响应
+        clean_response = re.sub(
+            r"<think>.*?</think>", "", raw_response, flags=re.DOTALL
+        )
+
+        # 提取 JSON
+        if "```json" in clean_response:
+            clean_response = clean_response.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_response:
+            clean_response = clean_response.split("```")[1].split("```")[0].strip()
+
+        clean_response = clean_response.strip()
+        reflection = json.loads(clean_response)
+
+        passed = reflection.get("pass", False)
+        reason = reflection.get("reason", "No reason provided")
+
+        if passed:
+            logger.info(f"✅ Reflection PASSED: {reason}")
+            return {
+                "messages": [SystemMessage(content=f"✅ Reflection PASSED: {reason}")],
+                "reflection_count": reflection_count + 1,
+            }
+        else:
+            logger.warning(
+                f"🔄 Reflection FAILED: {reason}. Requesting re-reasoning..."
+            )
+            return {
+                "messages": [
+                    SystemMessage(
+                        content=f"🔄 Reflection FAILED: {reason}. Please provide a more specific answer based on knowledge graph data."
+                    )
+                ],
+                "reflection_count": reflection_count + 1,
+                "error": reason,
+            }
+
+    except Exception as e:
+        logger.error(f"❌ Reflection check failed: {e}. Defaulting to PASS.")
+        return {
+            "messages": [
+                SystemMessage(
+                    content=f"⚠️ Reflection check error: {e}. Proceeding with answer."
+                )
+            ],
+            "reflection_count": reflection_count + 1,
+        }

@@ -10,8 +10,16 @@ import os
 import logging
 import re
 import asyncio
+import sys
 from typing import List, Tuple
 from dotenv import load_dotenv
+
+# Add project root to path
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from llama_index.core import SimpleDirectoryReader
 from llama_index.llms.openai_like import OpenAILike
@@ -24,7 +32,14 @@ from src.schema.ontology import EntityLabel, RelationType
 load_dotenv()
 
 # 配置日志
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("data_extraction.log", mode="a", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 # 黑名单：如果在实体名称中发现这些词，直接丢弃
@@ -64,8 +79,11 @@ class SemiIndexer:
             temperature=0.0,  # 强制确定性输出
         )
         self.db = Neo4jClient()
+        # Pre-calculate sets for faster validation
+        self.valid_labels = {e.value for e in EntityLabel}
+        self.valid_relations = {r.value for r in RelationType}
 
-    def _filter_chunk(self, text: str) -> bool:
+    def _filter_chunk(self, text: str, chunk_id: str) -> bool:
         """
         Step 1: 粗筛。
         判断文本块是否包含具体的半导体行业关系信息。
@@ -83,61 +101,98 @@ class SemiIndexer:
             "--- Decision ---\n"
         )
         try:
-            response = self.llm.complete(prompt).text.strip().upper()
+            response = self.llm.complete(prompt, timeout=90.0).text.strip().upper()
             return "YES" in response
         except Exception as e:
-            logger.warning(f"Filter check failed: {e}")
-            return False
+            # Re-raise context errors to be handled by recursive split
+            error_str = str(e).lower()
+            if any(msg in error_str for msg in ["context size", "400", "too long"]):
+                raise e
+            logger.warning(f"[{chunk_id}] Filter check failed (non-critical): {e}")
+            return True  # Keep text if unsure
 
     def _clean_entity_name(self, name: str) -> str:
         """清洗实体名称"""
-        # 移除 Markdown、标点
+        # 移除 Markdown、标点符号
         name = re.sub(r"[*_`'\"\[\]]", "", name)
+
+        # 分割驼峰命名: NVIDIAProducts -> NVIDIA Products
+        name = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
+
         # 移除开头结尾的非字母数字
         name = re.sub(r"^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$", "", name)
-        return name.strip()
+
+        # 移除多余空格
+        name = re.sub(r"\s+", " ", name).strip()
+
+        return name
 
     def _is_valid_entity(self, name: str) -> bool:
         """校验实体有效性"""
         name_lower = name.lower()
-        if len(name) < 2 or len(name) > 50:
+
+        # 长度检查
+        if len(name) < 3 or len(name) > 50:
             return False
+
+        # 如果整个名称是黑名单词，拒绝
         if name_lower in ENTITY_BLACKLIST:
             return False
+
+        # 如果名称包含任何黑名单词，拒绝
+        for word in ENTITY_BLACKLIST:
+            if word in name_lower:
+                return False
+
         # 过滤纯数字
         if name.isdigit():
             return False
+
+        # 过滤纯符号
+        if not re.search(r"[a-zA-Z]", name):
+            return False
+
         return True
 
     def extract_triplets_manually(
-        self, text: str
+        self, text: str, chunk_id: str
     ) -> List[Tuple[str, str, str, str, str]]:
         """
-        Step 2: 精细提取。
+        Step 2: 精细提取三元组。
         """
-        # 动态构建有效标签列表
+        logger.info(f"[{chunk_id}] --- INPUT TEXT SEGMENT ---\n{text}\n{'-' * 40}")
         valid_labels = ", ".join([e.value for e in EntityLabel])
         valid_relations = ", ".join([r.value for r in RelationType])
 
-        prompt = (
-            "You are a strict Semiconductor Industry Analyst.\n"
-            "Extract Entity-Relation-Entity triplets from the text.\n"
-            "Format: Subject|SubjectLabel|Relation|Object|ObjectLabel\n\n"
-            "Rules:\n"
-            f"1. SubjectLabel/ObjectLabel MUST be one of: {valid_labels}\n"
-            f"2. Relation MUST be one of: {valid_relations}\n"
-            "3. IGNORE generic terms like 'Products', 'Customers', 'Company'. Extract ONLY specific names (e.g., 'NVIDIA', 'H100', 'TSMC').\n"
-            "4. If no specific named entities exist, output nothing.\n"
-            "--- Example ---\n"
-            "NVIDIA|Organization|DEVELOPS|Blackwell|Technology\n"
-            "TSMC|Organization|HEADQUARTERED_IN|Taiwan|Geography\n"
-            "--- Text ---\n"
-            f"{text}\n"
-            "--- Output ---\n"
-        )
+        prompt = f"""You are a Semiconductor Industry Expert.
+
+TASK: Extract Entity-Relation-Entity triplets from the provided TEXT only.
+
+RULES:
+1. Subject and Object MUST be SPECIFIC NAMED ENTITIES found in the provided TEXT.
+2. Do NOT extract entities from the EXAMPLES below.
+3. Labels: {valid_labels}
+4. Relations: {valid_relations}
+5. Output: Subject|Label|Relation|Object|Label (one per line)
+
+EXAMPLES:
+NVIDIA|Organization|DEVELOPS|Blackwell|Technology
+TSMC|Organization|SUPPLIES|NVIDIA|Organization
+US|Geography|RESTRICTED_EXPORT|H20|Technology
+NVIDIA|Organization|REVENUE|$35B|Metric
+Data Center|IndustrySegment|REVENUE|$26B|Metric
+Taiwan|Geography|LOCATED_AT|TSMC|Organization
+
+TEXT:
+{text}
+
+OUTPUT:"""
 
         try:
-            raw_response = self.llm.complete(prompt).text
+            raw_response = self.llm.complete(prompt, timeout=180.0).text
+            logger.info(
+                f"[{chunk_id}] --- RAW LLM RESPONSE ---\n{raw_response}\n{'-' * 40}"
+            )
             # 清洗 DeepSeek/Qwen 的思维链标签
             clean_response = re.sub(
                 r"<think>.*?</think>", "", raw_response, flags=re.DOTALL
@@ -157,21 +212,19 @@ class SemiIndexer:
                         o = self._clean_entity_name(o)
 
                         # Enforce strict ontology compliance
-                        # Optimization: Pre-compute these sets in __init__ if performance matters,
-                        # but for now list comprehension is fine for readability.
-                        if s_l not in [e.value for e in EntityLabel]:
+                        if s_l not in self.valid_labels:
                             logger.debug(
-                                f"Dropped triplet due to invalid Subject Label: {s_l}"
+                                f"[{chunk_id}] Dropped triplet due to invalid Subject Label: {s_l}"
                             )
                             continue
-                        if o_l not in [e.value for e in EntityLabel]:
+                        if o_l not in self.valid_labels:
                             logger.debug(
-                                f"Dropped triplet due to invalid Object Label: {o_l}"
+                                f"[{chunk_id}] Dropped triplet due to invalid Object Label: {o_l}"
                             )
                             continue
-                        if r not in [rel.value for rel in RelationType]:
+                        if r not in self.valid_relations:
                             logger.debug(
-                                f"Dropped triplet due to invalid Relation: {r}"
+                                f"[{chunk_id}] Dropped triplet due to invalid Relation: {r}"
                             )
                             continue
 
@@ -179,62 +232,119 @@ class SemiIndexer:
                             triplets.append((s, s_l, r, o, o_l))
             return triplets
         except Exception as e:
-            logger.error(f"Extraction failed: {e}")
+            error_str = str(e).lower()
+            if any(msg in error_str for msg in ["context size", "400", "too long"]):
+                raise e
+            logger.error(f"[{chunk_id}] Extraction failed: {e}")
             return []
 
-    def ingest_document(self, file_path: str):
-        """处理文档并直接写入 Neo4j"""
-        logger.info(f"Processing {file_path}...")
+    def _ingest_chunk_recursive(
+        self, chunk_text: str, chunk_id: str, source_file: str
+    ) -> int:
+        """递归处理 Chunk，如果遇到上下文超限则继续切分"""
+        try:
+            # Step 1: Filter
+            if not self._filter_chunk(chunk_text, chunk_id):
+                logger.info(
+                    f"[{chunk_id}] SKIP: No relevant semiconductor facts found."
+                )
+                return 0
 
-        # 使用 LlamaIndex 读取 PDF，但只作为文本加载器
+            # Step 2: Extract
+            triplets = self.extract_triplets_manually(chunk_text, chunk_id)
+            if not triplets:
+                logger.info(
+                    f"[{chunk_id}] WARNING: No triplets extracted from this chunk."
+                )
+                return 0
+
+            logger.info(f"[{chunk_id}] SUCCESS: Extracted {len(triplets)} triplets:")
+
+            # Step 3: Ingest
+            count = 0
+            for s, s_l, r, o, o_l in triplets:
+                logger.info(f"    - Found: ({s}:{s_l}) -[{r}]-> ({o}:{o_l})")
+                query = (
+                    f"MERGE (a:{s_l} {{name: $s_name}}) "
+                    f"ON CREATE SET a.source = $source "
+                    f"MERGE (b:{o_l} {{name: $o_name}}) "
+                    f"ON CREATE SET b.source = $source "
+                    f"MERGE (a)-[r:{r}]->(b)"
+                )
+                params = {
+                    "s_name": s,
+                    "o_name": o,
+                    "source": source_file,
+                }
+                try:
+                    self.db.run_query(query, params)
+                    count += 1
+                except Exception as e:
+                    logger.error(
+                        f"[{chunk_id}] Failed to insert relation {s}->{o}: {e}"
+                    )
+            return count
+
+        except Exception as e:
+            if "context size" in str(e).lower():
+                logger.warning(
+                    f"[{chunk_id}] ERROR: Context size exceeded. Re-splitting this chunk..."
+                )
+
+                # 将文本大致对半切分，尽量在换行或点处切断
+                mid = len(chunk_text) // 2
+                split_pos = chunk_text.find("\n", mid)
+                if split_pos == -1 or split_pos > mid + 200:
+                    split_pos = chunk_text.find(". ", mid)
+                if split_pos == -1:
+                    split_pos = chunk_text.find(" ", mid)
+                if split_pos == -1:
+                    split_pos = mid
+
+                part1 = chunk_text[:split_pos].strip()
+                part2 = chunk_text[split_pos:].strip()
+
+                logger.info(
+                    f"[{chunk_id}] SPLIT: Split into Part 1 ({len(part1)} chars) and Part 2 ({len(part2)} chars)"
+                )
+
+                c1 = self._ingest_chunk_recursive(part1, f"{chunk_id}-p1", source_file)
+                c2 = self._ingest_chunk_recursive(part2, f"{chunk_id}-p2", source_file)
+                return c1 + c2
+            else:
+                logger.error(f"[{chunk_id}] Unexpected error: {e}")
+                return 0
+
+    def ingest_document(
+        self, file_path: str, chunk_size: int = 1024, chunk_overlap: int = 200
+    ) -> int:
+        """处理文档并流式写入 Neo4j，返回插入的关系总数"""
+        filename = os.path.basename(file_path)
+        logger.info(f"[{filename}] [START] Start processing...")
+
         reader = SimpleDirectoryReader(input_files=[file_path])
         documents = reader.load_data()
 
-        # 文本切分 (Chunking) - 使用 SentenceSplitter 保持语义完整性
-        splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=100)
+        splitter = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
         total_relations = 0
 
         for i, doc in enumerate(documents):
             chunks = splitter.split_text(doc.text)
-            logger.info(f"Page {i + 1}: {len(chunks)} chunks.")
+            logger.info(f"[{filename}] Page {i + 1}: {len(chunks)} chunks.")
 
             for chunk_idx, chunk_text in enumerate(chunks):
-                # Step 1: Filter
-                if not self._filter_chunk(chunk_text):
-                    logger.debug(f"Chunk {chunk_idx} filtered out (irrelevant).")
-                    continue
-
-                # Step 2: Extract
-                triplets = self.extract_triplets_manually(chunk_text)
-                if not triplets:
-                    continue
-
-                # Step 3: Ingest (Direct Cypher)
-                for s, s_l, r, o, o_l in triplets:
-                    query = (
-                        f"MERGE (a:{s_l} {{name: $s_name}}) "
-                        f"ON CREATE SET a.source = $source "
-                        f"MERGE (b:{o_l} {{name: $o_name}}) "
-                        f"ON CREATE SET b.source = $source "
-                        f"MERGE (a)-[r:{r}]->(b) "
-                    )
-                    params = {
-                        "s_name": s,
-                        "o_name": o,
-                        "source": os.path.basename(file_path),
-                    }
-                    try:
-                        self.db.run_query(query, params)
-                        total_relations += 1
-                    except Exception as e:
-                        logger.error(f"Failed to insert relation {s}->{o}: {e}")
+                chunk_id = f"{filename}][Page {i + 1}-Chunk {chunk_idx}"
+                total_relations += self._ingest_chunk_recursive(
+                    chunk_text, chunk_id, filename
+                )
 
             logger.info(
-                f"Page {i + 1} processed. Total relations so far: {total_relations}"
+                f"[{filename}] Page {i + 1} processed. Total relations so far: {total_relations}"
             )
 
-        logger.info(f"Finished {file_path}. Total inserted: {total_relations}")
+        logger.info(f"[{filename}] [DONE] Finished. Total inserted: {total_relations}")
+        return total_relations
 
 
 if __name__ == "__main__":
@@ -248,9 +358,10 @@ if __name__ == "__main__":
 
     init_constraints()
 
-    # 测试文件
-    test_pdf = "data/reports/NVDA-F1Q26-Quarterly-Presentation-FINAL.pdf"
+    # 单文件测试 - 使用最小的文件
+    test_pdf = "data/NVDA-F3Q26-Quarterly-Presentation.pdf"
     if os.path.exists(test_pdf):
+        logger.info(f"Processing: {test_pdf}")
         indexer.ingest_document(test_pdf)
     else:
-        logger.error("Data reports not found.")
+        logger.error(f"File not found: {test_pdf}")

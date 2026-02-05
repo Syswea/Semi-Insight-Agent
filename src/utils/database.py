@@ -66,7 +66,7 @@ class Neo4jClient:
         driver = self.connect()
         with driver.session() as session:
             session.run("MATCH (n) DETACH DELETE n")
-            logger.warning("⚠️ Database has been CLEARED.")
+            logger.warning("Database has been CLEARED.")
 
 
 def init_constraints():
