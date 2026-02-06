@@ -7,17 +7,15 @@ src/workflow/nodes.py
 
 import json
 import logging
-from typing import Dict, Any
+import os
+import re
+from typing import Dict, Any, cast
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 from src.state import AgentState
 from src.tools.cypher_query import CypherQueryEngine
 from llama_index.llms.openai_like import OpenAILike
-import os
-
-
-import re  # Added import
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +57,11 @@ def reasoning_node(state: AgentState) -> Dict[str, Any]:
         "If you need real-time info from the web:\n"
         '{"action": "web_search", "query": "YOUR_QUESTION_HERE"}\n\n'
         "If you have enough info to answer:\n"
-        '{"action": "final_answer", "content": "YOUR_FINAL_ANSWER"}\n\n'
+        '{"action": "final_answer", "content": "YOUR_FINAL_ANSWER", "requires_debate": true/false, "confidence": 0.0-1.0}\n\n'
         "--- Constraints ---\n"
         "1. Output ONLY valid JSON.\n"
         "2. Do not explain your thought process outside the JSON.\n"
+        "3. Set `requires_debate` to true for investment advice, competitive analysis, or complex industry trends. Set to false for simple facts (founding dates, HQs, single metrics).\n"
     )
 
     # 简单的将消息转换为文本上下文
@@ -94,7 +93,7 @@ def reasoning_node(state: AgentState) -> Dict[str, Any]:
 
         clean_response = clean_response.strip()
 
-        decision = json.loads(clean_response)
+        decision = json.loads(cast(str, clean_response))
         return {"messages": [AIMessage(content=json.dumps(decision))]}
     except Exception as e:
         # Capture raw_response if available, otherwise use "Unknown"
@@ -130,11 +129,10 @@ def tool_execution_node(state: AgentState) -> Dict[str, Any]:
     # Fallback to JSON parsing for our current implementation
     try:
         content = last_message.content
-        if isinstance(content, str):
-            decision = json.loads(content)
-        else:
-            decision = json.loads(str(content))
+        if not isinstance(content, str):
+            content = str(content)
 
+        decision = json.loads(cast(str, content))
         action = decision.get("action")
 
         if action == "query_graph":
@@ -186,7 +184,13 @@ def reflection_node(state: AgentState) -> Dict[str, Any]:
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             try:
-                decision = json.loads(msg.content)
+                content = msg.content
+                if not isinstance(content, str):
+                    content = str(content)
+                clean_content = re.sub(
+                    r"<think>.*?</think>", "", content, flags=re.DOTALL
+                )
+                decision = json.loads(clean_content)
                 if decision.get("action") == "final_answer":
                     final_answer = decision.get("content")
                     break
@@ -252,7 +256,7 @@ def reflection_node(state: AgentState) -> Dict[str, Any]:
             clean_response = clean_response.split("```")[1].split("```")[0].strip()
 
         clean_response = clean_response.strip()
-        reflection = json.loads(clean_response)
+        reflection = json.loads(cast(str, clean_response))
 
         passed = reflection.get("pass", False)
         reason = reflection.get("reason", "No reason provided")

@@ -1,128 +1,155 @@
 """
 src/workflow/debate.py
 
-多代理辩论模块：包含辩论节点和路由器
-
-Components:
-1. debate_router: 路由判断节点
-2. debate_node: AutoGen 多代理辩论节点
-
-Design:
-- 路由节点保留扩展性，可添加条件分支
-- 辩论节点使用 AutoGen 实现评分式辩论
+多代理辩论模块：包含辩论节点和基于 AutoGen 的真实多代理对抗。
 """
 
 import json
 import logging
+import re
+import os
 from typing import Dict, Any, List, Optional
 
+import autogen
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-from langchain_core.messages.utils import convert_to_messages
+from llama_index.llms.openai_like import OpenAILike
 
 from src.state import AgentState
-from src.agents.debate_agents import (
-    create_debate_panel,
-    create_debate_intro,
-    DEBATE_CONFIG,
-)
-from llama_index.llms.openai_like import OpenAILike
-import os
 
 logger = logging.getLogger(__name__)
 
-# 初始化辩论 LLM (独立配置)
-debate_llm = OpenAILike(
-    model=os.getenv("LLM_MODEL", "qwen/qwen3-14b"),
-    api_base=os.getenv("OPENAI_API_BASE", "http://127.0.0.1:1234/v1"),
-    api_key=os.getenv("OPENAI_API_KEY", "lm-studio"),
-    is_chat_model=True,
-    timeout=300.0,
-    temperature=0.7,  # 辩论需要一定创造性
-)
+# AutoGen 配置
+AUTOGEN_LLM_CONFIG = {
+    "config_list": [
+        {
+            "model": os.getenv("LLM_MODEL", "qwen/qwen3-14b"),
+            "base_url": os.getenv("OPENAI_API_BASE", "http://127.0.0.1:1234/v1"),
+            "api_key": os.getenv("OPENAI_API_KEY", "lm-studio"),
+        }
+    ],
+    "cache_seed": 42,
+    "temperature": 0.7,
+}
 
 
-def debate_router(state: AgentState) -> str:
+def run_autogen_debate(question: str, context: str) -> Dict[str, Any]:
     """
-    辩论路由节点
-
-    功能：
-    1. 接收 Reflection 结果
-    2. 判断下一步流向
-    3. 支持扩展其他分支（未来可添加条件路由）
-
-    当前策略：
-    - 总是路由到辩论节点（无条件）
-    - 保留扩展性，可添加：
-        * high_confidence → 直接输出
-        * investment_question → 辩论
-        * risk_assessment → 辩论
-
-    Args:
-        state: AgentState
-
-    Returns:
-        下一个节点名称
+    运行完整的 AutoGen 多代理辩论
     """
-    logger.info("[Debate Router] Evaluating next step...")
-
-    messages = state.get("messages", [])
-    reflection_count = state.get("reflection_count", 0)
-
-    # 获取用户问题
-    user_question = None
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            user_question = msg.content
-            break
-
-    # 获取 Reflection 结果
-    reflection_passed = False
-    for msg in reversed(messages):
-        if isinstance(msg, SystemMessage) and "PASSED" in msg.content:
-            reflection_passed = True
-            break
-
-    logger.info(
-        f"[Debate Router] Question: {user_question[:50] if user_question else 'N/A'}..."
+    from src.agents.debate_agents import (
+        BULLISH_SYSTEM_MESSAGE,
+        BEARISH_SYSTEM_MESSAGE,
+        JUDGE_SYSTEM_MESSAGE,
     )
-    logger.info(f"[Debate Router] Reflection passed: {reflection_passed}")
-    logger.info(f"[Debate Router] Reflection count: {reflection_count}")
 
-    # =========================================================================
-    # 路由策略（可扩展）
-    # =========================================================================
-    # 当前策略：总是进入辩论
-    # 未来可添加：
-    #   - if confidence > 0.9: return "final_answer"  # 高置信度直接输出
-    #   - if is_investment_question: return "debate"  # 投资问题进入辩论
-    #   - if user_pref == "quick": return "final_answer"  # 用户偏好快速回答
+    logger.info("[AutoGen] Initializing debate agents...")
 
-    logger.info("[Debate Router] Routing to: debate (always route for demo)")
+    # 1. 定义 Agents
+    bullish_analyst = autogen.AssistantAgent(
+        name="BullishAnalyst",
+        system_message=BULLISH_SYSTEM_MESSAGE,
+        llm_config=AUTOGEN_LLM_CONFIG,
+    )
 
-    return "debate"
+    bearish_analyst = autogen.AssistantAgent(
+        name="BearishAnalyst",
+        system_message=BEARISH_SYSTEM_MESSAGE,
+        llm_config=AUTOGEN_LLM_CONFIG,
+    )
+
+    judge = autogen.AssistantAgent(
+        name="JudgeAgent",
+        system_message=JUDGE_SYSTEM_MESSAGE,
+        llm_config=AUTOGEN_LLM_CONFIG,
+    )
+
+    user_proxy = autogen.UserProxyAgent(
+        name="UserProxy",
+        human_input_mode="NEVER",
+        max_consecutive_auto_reply=3,
+        is_termination_msg=lambda x: "TERMINATE" in (x.get("content") or ""),
+        code_execution_config=False,
+    )
+
+    # 2. 组建 GroupChat
+    groupchat = autogen.GroupChat(
+        agents=[user_proxy, bullish_analyst, bearish_analyst, judge],
+        messages=[],
+        max_round=6,
+        speaker_selection_method="round_robin",
+    )
+
+    manager = autogen.GroupChatManager(
+        groupchat=groupchat, llm_config=AUTOGEN_LLM_CONFIG
+    )
+
+    # 3. 开始辩论
+    debate_topic = f"Topic: {question}\n\nBackground Context: {context}\n\nPlease analyze this topic from your respective perspectives. Judge, provide the final structured JSON scores after everyone has spoken."
+
+    logger.info("[AutoGen] Starting Group Chat...")
+    user_proxy.initiate_chat(manager, message=debate_topic)
+
+    # 4. 提取结果
+    debate_transcript = {}
+    last_json = None
+
+    for i, msg in enumerate(groupchat.messages):
+        sender = msg.get("name", "Unknown")
+        content = msg.get("content", "")
+        debate_transcript[f"step_{i}_{sender}"] = content
+
+        if sender == "JudgeAgent":
+            try:
+                clean_msg = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                if "```json" in clean_msg:
+                    clean_msg = clean_msg.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_msg:
+                    clean_msg = clean_msg.split("```")[1].split("```")[0].strip()
+
+                potential_json = json.loads(clean_msg.strip())
+                if "bull_score" in potential_json:
+                    last_json = potential_json
+            except:
+                continue
+
+    if not last_json:
+        # 回退逻辑
+        logger.warning("[AutoGen] Judge failed to provide JSON, using default scores.")
+        last_json = {
+            "bull_score": 50,
+            "bear_score": 50,
+            "final_score": 50,
+            "confidence": "low",
+            "key_bull_points": ["分析未完成"],
+            "key_bear_points": ["风险评估未完成"],
+            "risk_level": "medium",
+            "recommendation": "Hold",
+        }
+
+    return {
+        "debate_transcript": debate_transcript,
+        "scores": {
+            "bull_score": last_json.get("bull_score", 50),
+            "bear_score": last_json.get("bear_score", 50),
+            "final_score": last_json.get("final_score", 50),
+            "confidence": last_json.get("confidence", "medium"),
+        },
+        "key_points": {
+            "bull": last_json.get("key_bull_points", []),
+            "bear": last_json.get("key_bear_points", []),
+        },
+        "assessment": {
+            "risk_level": last_json.get("risk_level", "medium"),
+            "recommendation": last_json.get("recommendation", "Hold"),
+        },
+    }
 
 
 def debate_node(state: AgentState) -> Dict[str, Any]:
     """
-    辩论执行节点
-
-    功能：
-    1. 收集基础分析上下文
-    2. 初始化 AutoGen 辩论
-    3. 执行辩论流程
-    4. 提取评分和辩论记录
-    5. 更新 State
-
-    辩论流程：
-    1. Bullish 分析 → 2. Bearish 分析 → 3. Judge 评分
-
-    Args:
-        state: AgentState
-
-    Returns:
-        更新后的 State 字典
+    辩论执行节点：调用 AutoGen 进行多代理对抗。
     """
-    logger.info("[Debate Node] Starting multi-agent debate...")
+    logger.info("[Debate Node] Starting multi-agent debate with AutoGen...")
 
     messages = state.get("messages", [])
 
@@ -133,173 +160,60 @@ def debate_node(state: AgentState) -> Dict[str, Any]:
             user_question = msg.content
             break
 
-    # 提取基础分析结果
-    context_parts = []
-    for msg in messages:
-        if isinstance(msg, SystemMessage):
-            content = msg.content
-            if "Search Result:" in content or "Answer" in content:
-                context_parts.append(content)
-
-    context = (
-        "\n\n".join(context_parts[-5:]) if context_parts else "No additional context."
-    )
-
-    # 提取最终答案（如果有）
+    # 提取最终答案或上下文作为背景
     final_answer = None
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             try:
-                decision = json.loads(msg.content)
+                content = msg.content
+                if not isinstance(content, str):
+                    content = str(content)
+                clean_content = re.sub(
+                    r"<think>.*?</think>", "", content, flags=re.DOTALL
+                )
+                decision = json.loads(clean_content)
                 if decision.get("action") == "final_answer":
                     final_answer = decision.get("content")
                     break
             except:
                 pass
 
-    logger.info(
-        f"[Debate Node] Question: {user_question[:100] if user_question else 'N/A'}..."
+    context_parts = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            if "Search Result:" in msg.content:
+                context_parts.append(msg.content)
+
+    context = (
+        "\n\n".join(context_parts[-3:])
+        if context_parts
+        else "No specific search context."
     )
-    logger.info(f"[Debate Node] Context length: {len(context)} chars")
-
-    # =========================================================================
-    # 简化的辩论流程（不使用完整 AutoGen，降低复杂度）
-    # =========================================================================
-    # 使用 LLM 模拟辩论过程，输出结构化结果
-
-    debate_prompt = f"""You are facilitating a debate between a Bullish and Bearish analyst about a semiconductor company.
-
-Question: {user_question}
-
-Background Analysis:
-{final_answer or context}
-
-## Debate Instructions
-
-Round 1 - Initial Arguments:
-1. Write the Bullish Analyst's perspective (3-5 key points, optimistic but grounded)
-2. Write the Bearish Analyst's perspective (3-5 key points, critical but fair)
-
-Round 2 - Final Statements:
-1. Bullish Analyst's final statement (incorporate counter-arguments if any)
-2. Bearish Analyst's final statement (incorporate counter-arguments if any)
-
-Judge's Verdict:
-Evaluate both perspectives and provide:
-- Bull score (0-100): How convincing are the bullish arguments?
-- Bear score (0-100): How valid are the bearish concerns?
-- Final score (0-100): Weighted average (50% bull, 50% bear)
-- Confidence level: high/medium/low
-- Key bull points: top 3 arguments from bull side
-- Key bear points: top 3 arguments from bear side
-- Risk level: low/medium/high
-- Recommendation: Buy/Hold/Sell/Neutral
-
-Output format (JSON only):
-```json
-{{
-    "debate_transcript": {{
-        "round_1": {{
-            "bullish": "Full bullish argument...",
-            "bearish": "Full bearish argument..."
-        }},
-        "round_2": {{
-            "bullish": "Final bullish statement...",
-            "bearish": "Final bearish statement..."
-        }}
-    }},
-    "scores": {{
-        "bull_score": <0-100>,
-        "bear_score": <0-100>,
-        "final_score": <0-100>,
-        "confidence": "high" | "medium" | "low"
-    }},
-    "key_points": {{
-        "bull": ["point1", "point2", "point3"],
-        "bear": ["point1", "point2", "point3"]
-    }},
-    "assessment": {{
-        "risk_level": "low" | "medium" | "high",
-        "recommendation": "Buy" | "Hold" | "Sell" | "Neutral"
-    }}
-}}
-```
-
-Respond with ONLY valid JSON."""
+    background = final_answer if final_answer else context
 
     try:
-        logger.info("[Debate Node] Running debate simulation...")
-        raw_response = debate_llm.complete(debate_prompt).text.strip()
-
-        # 清洗响应
-        clean_response = raw_response
-        if "```json" in clean_response:
-            clean_response = clean_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_response:
-            clean_response = clean_response.split("```")[1].split("```")[0].strip()
-
-        clean_response = clean_response.strip()
-        debate_result = json.loads(clean_response)
-
-        logger.info(
-            f"[Debate Node] Debate completed. Final score: {debate_result.get('scores', {}).get('final_score', 'N/A')}"
-        )
-
+        debate_result = run_autogen_debate(user_question or "未知问题", background)
     except Exception as e:
-        logger.error(f"[Debate Node] Debate failed: {e}")
-        # 回退到基础结果
+        logger.error(f"[Debate Node] AutoGen debate failed: {e}")
         debate_result = {
-            "debate_transcript": {
-                "round_1": {
-                    "bullish": "Debate simulation unavailable.",
-                    "bearish": "Debate simulation unavailable.",
-                },
-                "round_2": {
-                    "bullish": "Using fallback assessment.",
-                    "bearish": "Using fallback assessment.",
-                },
-            },
+            "debate_transcript": {"error": str(e)},
             "scores": {
                 "bull_score": 50,
                 "bear_score": 50,
                 "final_score": 50,
                 "confidence": "low",
             },
-            "key_points": {
-                "bull": ["Unable to analyze"],
-                "bear": ["Unable to analyze"],
-            },
-            "assessment": {"risk_level": "medium", "recommendation": "Neutral"},
+            "key_points": {"bull": ["辩论执行失败"], "bear": ["辩论执行失败"]},
+            "assessment": {"risk_level": "medium", "recommendation": "Hold"},
         }
-
-    # =========================================================================
-    # 生成最终报告
-    # =========================================================================
 
     final_report = generate_final_report(
         question=user_question,
-        base_answer=final_answer or context,
+        base_answer=background,
         debate_result=debate_result,
     )
 
-    # =========================================================================
-    # 更新 State
-    # =========================================================================
-
     return {
-        "messages": [
-            SystemMessage(
-                content=json.dumps(
-                    {
-                        "action": "debate_complete",
-                        "debate_transcript": debate_result.get("debate_transcript", {}),
-                        "scores": debate_result.get("scores", {}),
-                        "key_points": debate_result.get("key_points", {}),
-                        "assessment": debate_result.get("assessment", {}),
-                    }
-                )
-            )
-        ],
         "debate_transcript": debate_result.get("debate_transcript", {}),
         "debate_scores": debate_result.get("scores", {}),
         "debate_key_points": debate_result.get("key_points", {}),
@@ -309,20 +223,12 @@ Respond with ONLY valid JSON."""
 
 
 def generate_final_report(
-    question: str,
-    base_answer: str,
+    question: Any,
+    base_answer: Any,
     debate_result: Dict[str, Any],
 ) -> str:
     """
     生成最终研判报告
-
-    Args:
-        question: 用户问题
-        base_answer: 基础分析答案
-        debate_result: 辩论结果
-
-    Returns:
-        格式化的最终报告
     """
     scores = debate_result.get("scores", {})
     key_points = debate_result.get("key_points", {})
@@ -335,61 +241,45 @@ def generate_final_report(
     recommendation = assessment.get("recommendation", "Neutral")
     risk_level = assessment.get("risk_level", "medium")
 
-    # 生成报告
-    report = f"""# 半导体行业研判报告
-
-## 一、问题回顾
-**用户问题：** {question}
-
-## 二、基础分析
-{base_answer}
-
-## 三、多代理辩论评分
-
-### 🟢 看多方观点 (得分: {bull_score}/100)
-"""
+    report_lines = [
+        "# 半导体行业研判报告",
+        "",
+        "## 一、问题回顾",
+        f"**用户问题：** {question}",
+        "",
+        "## 二、基础分析",
+        f"{base_answer}",
+        "",
+        "## 三、多代理辩论评分 (via AutoGen)",
+        "",
+        f"### 🟢 看多方观点 (得分: {bull_score}/100)",
+    ]
 
     for i, point in enumerate(key_points.get("bull", [])[:5], 1):
-        report += f"{i}. {point}\n"
+        report_lines.append(f"{i}. {point}")
 
-    report += f"""
-
-### 🔴 看空方观点 (得分: {bear_score}/100)
-"""
-
+    report_lines.append("")
+    report_lines.append(f"### 🔴 看空方观点 (得分: {bear_score}/100)")
     for i, point in enumerate(key_points.get("bear", [])[:5], 1):
-        report += f"{i}. {point}\n"
+        report_lines.append(f"{i}. {point}")
 
-    report += f"""
+    report_lines.extend(
+        [
+            "",
+            f"### 📊 综合评分: {final_score}/100",
+            f"- **置信度:** {str(confidence).upper()}",
+            f"- **风险等级:** {str(risk_level).upper()}",
+            f"- **综合建议:** {recommendation}",
+            "",
+            "## 四、结论",
+        ]
+    )
 
-### 📊 综合评分: {final_score}/100
-- **置信度:** {confidence.upper()}
-- **风险等级:** {risk_level.upper()}
-- **综合建议:** {recommendation}
-
-## 四、结论
-"""
-
-    # 根据最终分数生成结论
     if final_score >= 70:
-        report += "综合来看，公司基本面良好，技术领先，建议积极关注。"
+        report_lines.append("综合来看，公司基本面良好，技术领先，建议积极关注。")
     elif final_score >= 50:
-        report += "综合来看，公司有一定优势但也存在风险，建议谨慎观望。"
+        report_lines.append("综合来看，公司有一定优势但也存在风险，建议谨慎观望。")
     else:
-        report += "综合来看，公司面临较大不确定性，建议回避或减持。"
+        report_lines.append("综合来看，公司面临较大不确定性，建议回避或减持。")
 
-    return report
-
-
-def extract_legacy_answer(state: AgentState) -> str:
-    """提取最终答案（兼容旧代码）"""
-    messages = state.get("messages", [])
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            try:
-                decision = json.loads(msg.content)
-                if decision.get("action") == "final_answer":
-                    return decision.get("content", "")
-            except:
-                pass
-    return ""
+    return "\n".join(report_lines)

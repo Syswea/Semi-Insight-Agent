@@ -12,12 +12,14 @@ Architecture:
 
 import json
 import logging
+import re
 from typing import Dict, Any
 from langgraph.graph import StateGraph, END
+from langchain_core.messages import AIMessage
 
 from src.state import AgentState
 from src.workflow.nodes import reasoning_node, tool_execution_node, reflection_node
-from src.workflow.debate import debate_router, debate_node
+from src.workflow.debate import debate_node
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +27,14 @@ logger = logging.getLogger(__name__)
 def router(state: AgentState) -> str:
     """
     路由函数：根据 Reasoning 节点的输出决定下一步。
-
-    支持的工具：
-    - query_graph: 查询知识图谱
-    - web_search: 网络搜索
-    - final_answer: 生成最终答案
     """
     last_message = state["messages"][-1]
     try:
-        decision = json.loads(last_message.content)
+        content = last_message.content
+        if not isinstance(content, str):
+            content = str(content)
+
+        decision = json.loads(content)
         action = decision.get("action")
 
         if action == "query_graph":
@@ -50,44 +51,62 @@ def router(state: AgentState) -> str:
 
 def reflection_router(state: AgentState) -> str:
     """
-    反思后的路由决策：根据反思结果决定是结束还是重新推理。
-
-    当前策略：
-    - 总是路由到辩论节点（无条件）
-    - 保留扩展性，可添加：
-        * high_confidence → 直接辩论
-        * user_preference → 快速回答
+    反思后的智能路由：
+    1. 如果反思失败 -> 返回 reasoning (重新思考)
+    2. 如果反思通过 -> 检查是否需要辩论
+    3. 如果是简单事实或高置信度 -> 直接 END
+    4. 否则 -> 进入 debate
     """
-    last_msg = state["messages"][-1]
+    messages = state["messages"]
+    last_msg = messages[-1]
 
-    if "PASSED" in last_msg.content:
-        logger.info("[Router] Reflection passed, routing to debate")
-        return "debate"  # 反思通过，进入辩论
-    elif "FAILED" in last_msg.content:
+    # 1. 检查反思结果
+    if "FAILED" in last_msg.content:
+        # 如果还没达到最大反思次数，尝试重新推理
+        if state.get("reflection_count", 0) < state.get("max_reflections", 2):
+            logger.info("[Router] Reflection failed, returning to reasoning")
+            return "reasoning"
+        else:
+            logger.info("[Router] Max reflections reached, forced to debate")
+            return "debate"
+
+    # 2. 获取之前的 AI 决策以判断是否需要辩论
+    requires_debate = True
+    confidence = 0.0
+
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            try:
+                # 使用正则清洗可能存在的 <think>
+                content = msg.content
+                if not isinstance(content, str):
+                    content = str(content)
+                clean_content = re.sub(
+                    r"<think>.*?</think>", "", content, flags=re.DOTALL
+                )
+                decision = json.loads(clean_content)
+                if decision.get("action") == "final_answer":
+                    requires_debate = decision.get("requires_debate", True)
+                    confidence = decision.get("confidence", 0.0)
+                    break
+            except:
+                continue
+
+    # 3. 智能判定
+    if not requires_debate:
         logger.info(
-            "[Router] Reflection failed, but still routing to debate for multi-perspective"
+            "[Router] Simple fact detected (requires_debate=False), skipping debate"
         )
-        return "debate"  # 即使反思失败，也进入辩论获取多视角
-    else:
-        logger.info("[Router] No clear reflection result, routing to debate")
-        return "debate"  # 默认进入辩论
+        return "end"
 
+    if confidence > 0.9:
+        logger.info(f"[Router] High confidence ({confidence}), skipping debate")
+        return "end"
 
-def debate_router(state: AgentState) -> Dict[str, Any]:
-    """
-    辩论路由节点（可扩展）
-
-    当前策略：辩论完成后直接结束
-    保留扩展性，未来可添加：
-    - low_confidence → 返回要求更多信息
-    - high_impact → 升级到人工审核
-    - follow_up_question → 继续对话
-    """
-    logger.info("[Debate Router] Debate completed, ending workflow")
-
-    # 辩论完成后直接结束，不需要更新状态
-    # 这里返回 None 表示不更新状态
-    return {}
+    logger.info(
+        f"[Router] Routing to debate (confidence={confidence}, requires_debate={requires_debate})"
+    )
+    return "debate"
 
 
 def build_agent_graph():
@@ -107,7 +126,6 @@ def build_agent_graph():
     workflow.add_node("reflection", reflection_node)
 
     # 辩论模块节点
-    workflow.add_node("debate_router", debate_router)
     workflow.add_node("debate", debate_node)
 
     # =========================================================================
@@ -141,15 +159,14 @@ def build_agent_graph():
         reflection_router,
         {
             "reasoning": "reasoning",  # 失败时可选择重新推理
-            "debate": "debate_router",  # 总是进入辩论模块
+            "debate": "debate",  # 直接进入辩论节点
             "end": END,
         },
     )
 
     # =========================================================================
-    # 7. 添加边 - 辩论路由器到辩论节点
+    # 7. 移除中间的多余路由
     # =========================================================================
-    workflow.add_edge("debate_router", "debate")
 
     # =========================================================================
     # 8. 添加边 - 辩论节点结束
